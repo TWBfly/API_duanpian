@@ -1,0 +1,31 @@
+# API Keys and Sensitive Config
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Data and Databases
+*.db
+*.db-journal
+*.lock
+.chroma_db/
+.chroma_db_test/
+novel_memory.db
+
+# Daily Output Folders (Novel content)
+202*
+novels/
+
+# Logs and Reports
+logs/
+audit/
+report/
+state/
+*.log
+
+# OS
+.DS_Store
