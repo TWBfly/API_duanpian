@@ -24,7 +24,7 @@ def main():
 
     response = client.responses.create(
         model="deepseek-v3-2-251201",
-        input=[{"role": "user", "content": "北京的天气怎么样？"}],
+        input=[{"role": "user", "content": "合肥的天气怎么样？"}],
        # tools=tools,
     )
 

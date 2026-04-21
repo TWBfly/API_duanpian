@@ -58,7 +58,7 @@ def main():
         skeleton_data={"plot_beat": "雪夜客栈遇刺", "foreshadowing_to_plant": "断流古剑"},
         chapter_id=chapter_id,
         history_context="无前情提要（开局）。",
-        candidate_count=2,
+        candidate_count=1,
     )
 
     print("\n" + "=" * 50)

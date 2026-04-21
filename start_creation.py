@@ -13,14 +13,10 @@ from auditors import DisguiseLogicAuditor
 def start():
     db = DatabaseManager()
     
-    # 1. Load Reference Style (Gold Library)
+    # 1. Legacy Gold Library loading is disabled.
     ref_path = "/Users/tang/PycharmProjects/pythonProject/fiveNovel/2026-03-27/半糖缘/半糖缘.md"
     if os.path.exists(ref_path):
-        with open(ref_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            # Split by chapters or long paragraphs to load into gold library
-            samples = content.split("\n\n")
-            db.clear_and_load_gold([s for s in samples if len(s.strip()) > 50])
+        print("⚠️ [安全策略] 已停用原文全文写入 Gold Library 的旧路径，仅保留抽象规则学习。")
     
     # 2. Genesis: Create Book Setting
     director = GenesisDirector()

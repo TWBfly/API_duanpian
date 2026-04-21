@@ -1,6 +1,8 @@
 from neo4j import GraphDatabase
 import logging
 import os
+import json
+import re
 
 class Neo4jManager:
     def __init__(self, uri=None, user=None, password=None):
@@ -49,15 +51,40 @@ class Neo4jManager:
         physical = props_dict.get("physical_state", {})
         cognitive = props_dict.get("cognitive_state", {})
         
-        # 如果老代码传的是扁平字典，默认全部作为物理状态
-        if "physical_state" not in props_dict and "cognitive_state" not in props_dict:
-            physical = props_dict
+        # 工业化加固：确保 physical 和 cognitive 始终为字典
+        if not isinstance(physical, dict):
+            if isinstance(physical, str):
+                try:
+                    physical = json.loads(physical)
+                except:
+                    physical = {"description": physical} 
+            else:
+                physical = {}
         
+        if not isinstance(cognitive, dict):
+            if isinstance(cognitive, str):
+                try:
+                    cognitive = json.loads(cognitive)
+                except:
+                    cognitive = {"description": cognitive}
+            else:
+                cognitive = {}
+
         set_statements = []
-        for k in physical.keys():
-            if k != 'novel_id': set_statements.append(f"c.`{k}` = $phys_{k}")
-        for k in cognitive.keys():
-            if k != 'novel_id': set_statements.append(f"c.`cog_{k}` = $cog_{k}")
+        # 遍历并将属性映射到参数
+        params = {"char_name": char_name, "novel_id": novel_id}
+        
+        for k, v in physical.items():
+            if k in ["novel_id", "char_name"]: continue
+            key_slug = re.sub(r'[^a-zA-Z0-9_]', '_', k)
+            set_statements.append(f"c.`{k}` = $phys_{key_slug}")
+            params[f"phys_{key_slug}"] = v
+        
+        for k, v in cognitive.items():
+            if k in ["novel_id", "char_name"]: continue
+            key_slug = re.sub(r'[^a-zA-Z0-9_]', '_', k)
+            set_statements.append(f"c.`cog_{k}` = $cog_{key_slug}")
+            params[f"cog_{key_slug}"] = v
             
         if not set_statements:
             set_statements = ["c.last_updated = datetime()"]
@@ -70,11 +97,6 @@ class Neo4jManager:
         MERGE (c:Character {{name: $char_name, novel_id: $novel_id}})
         SET {set_statements_str}
         """
-        params = {"char_name": char_name, "novel_id": novel_id}
-        for k, v in physical.items():
-            if k != 'novel_id': params[f"phys_{k}"] = v
-        for k, v in cognitive.items():
-            if k != 'novel_id': params[f"cog_{k}"] = v
         
         with self.driver.session() as session:
             session.run(query, **params)
@@ -103,6 +125,14 @@ class Neo4jManager:
                     "identity_mask": identity_mask or "无身份伪装",
                 }
             return {}
+
+    def get_all_characters_for_novel(self, novel_id):
+        """获取该作品所有已登场角色名单"""
+        if not self.driver: return []
+        query = "MATCH (c:Character {novel_id: $novel_id}) RETURN c.name AS name"
+        with self.driver.session() as session:
+            results = session.run(query, novel_id=novel_id)
+            return [record["name"] for record in results]
 
     # ====== 2. 动态伏笔池 (Causal DAG & TTR) ======
     def add_foreshadow(self, novel_id, item_desc, priority="B", target_chapter=None, sql_id=None, resolved=False):

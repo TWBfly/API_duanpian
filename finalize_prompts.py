@@ -2,6 +2,7 @@ import os
 import re
 import argparse
 import sys
+from novel_utils import expected_chapter_indices, normalize_total_chapters, chapter_type_for_index
 
 def num_to_chinese(num):
     chinese_nums = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
@@ -77,7 +78,13 @@ def main():
     parser = argparse.ArgumentParser(description="工业化大纲固化器 - 将大纲转为独立提示词")
     parser.add_argument("--input", type=str, required=True, help="输入大纲文件路径 (如 report/2大纲.md)")
     parser.add_argument("--out_dir", type=str, default="prompt_manual", help="输出文件夹")
+    parser.add_argument("--chapters", type=int, default=10, help="主线章节数，楔子另算；短篇系统上限为10")
     args = parser.parse_args()
+    try:
+        total_chapters = normalize_total_chapters(args.chapters)
+    except ValueError as exc:
+        print(f"❌ 参数错误：{exc}")
+        return
 
     if not os.path.exists(args.input):
         print(f"❌ 错误：未找到输入文件 {args.input}")
@@ -88,9 +95,28 @@ def main():
         
     os.makedirs(args.out_dir, exist_ok=True)
     chapters = split_and_prompt(content)
+    expected = set(expected_chapter_indices(total_chapters))
+    actual = {idx for idx, _, _, _ in chapters}
+    overflow = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    if overflow or missing:
+        if overflow:
+            print(f"❌ 错误：大纲包含越界章节：{overflow}，当前契约只允许 0..{total_chapters}")
+        if missing:
+            print(f"❌ 错误：大纲缺失章节：{missing}")
+        return
     
     for i, (idx, filename, title, body) in enumerate(chapters):
-        next_body = chapters[i+1][3] if i+1 < len(chapters) else "结局"
+        chapter_type = chapter_type_for_index(idx, total_chapters)
+        if chapter_type == "epilogue":
+            transition_block = """【终章闭环硬约束】
+- 本章是全书最后一章，不存在后续章节。
+- 必须完成：终极冲突、真相揭示、伏笔回收、反派清算、主角命运定格、首尾呼应。
+- 严禁新增伏笔、续章钩子、开放式未决主线。
+"""
+        else:
+            next_body = chapters[i+1][3]
+            transition_block = f"- 必须：与下一章之间自然过渡，下一章大纲预览「\n{next_body[:200]}...\n」"
         
         full_prompt = f"""【prompt：【
 - 作为一名职业网文大师，你的任务是创作引人入胜的{title}。
@@ -101,7 +127,7 @@ def main():
 # {title}
 {body}
 
-- 必须：与下一章之间自然过度，下一章大纲预览「\n{next_body[:200]}...\n」
+{transition_block}
 
 请开始创作{title}正文（要求字数 2000+，必须带上标题，标题固定为‘{title}’，笔触遵循“烽火戏诸侯/长短句张力风”）：
 """

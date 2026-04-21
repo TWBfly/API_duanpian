@@ -5,6 +5,8 @@ import os
 import fcntl
 from pathlib import Path
 
+from novel_utils import normalize_audience_type
+
 
 class DatabaseManager:
     def __init__(self, db_name=None):
@@ -103,6 +105,17 @@ class DatabaseManager:
             id INTEGER PRIMARY KEY,
             file_path TEXT UNIQUE
         )"""
+        )
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reference_fingerprint_bundles (
+                book_id TEXT PRIMARY KEY,
+                source_paths_json TEXT,
+                payload_json TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
 
         # 动态规则表
@@ -322,7 +335,7 @@ class DatabaseManager:
                 book_id TEXT UNIQUE,
                 title_seed TEXT NOT NULL,
                 total_chapters INTEGER DEFAULT 10,
-                candidate_count INTEGER DEFAULT 2,
+                candidate_count INTEGER DEFAULT 1,
                 priority INTEGER DEFAULT 100,
                 status TEXT DEFAULT 'pending',
                 rate_limit_group TEXT DEFAULT 'default',
@@ -368,7 +381,7 @@ class DatabaseManager:
         self._ensure_table_columns(
             "generation_tasks",
             {
-                "candidate_count": "candidate_count INTEGER DEFAULT 2",
+                "candidate_count": "candidate_count INTEGER DEFAULT 1",
                 "rate_limit_group": "rate_limit_group TEXT DEFAULT 'default'",
                 "max_attempts": "max_attempts INTEGER DEFAULT 3",
                 "next_run_after": "next_run_after DATETIME DEFAULT CURRENT_TIMESTAMP",
@@ -495,6 +508,48 @@ class DatabaseManager:
         
         return [{"original": r[0], "improved": r[1]} for r in self.cursor.fetchall()]
 
+    def save_reference_fingerprint_bundle(self, book_id, source_paths, payload):
+        self.cursor.execute(
+            """
+            INSERT INTO reference_fingerprint_bundles (book_id, source_paths_json, payload_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(book_id) DO UPDATE SET
+                source_paths_json = excluded.source_paths_json,
+                payload_json = excluded.payload_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (book_id, self._json_dumps(source_paths or []), self._json_dumps(payload or {})),
+        )
+        self.conn.commit()
+
+    def get_reference_fingerprint_bundle(self, book_id):
+        self.cursor.execute(
+            "SELECT payload_json FROM reference_fingerprint_bundles WHERE book_id = ? LIMIT 1",
+            (book_id,),
+        )
+        row = self.cursor.fetchone()
+        return self._json_loads(row[0], {}) if row else {}
+
+    def get_skill_rules(self, category, audience=None, limit=5):
+        categories = [f"skill_rule_{category}"]
+        if audience:
+            categories.insert(0, f"skill_rule_{category}_{audience}")
+
+        placeholders = ",".join(["?"] * len(categories))
+        self.cursor.execute(
+            f"""
+            SELECT rule_text
+            FROM rules_ledger
+            WHERE category IN ({placeholders})
+              AND is_active = 1
+              AND bayesian_weight >= 0.3
+            ORDER BY bayesian_weight DESC, id DESC
+            LIMIT ?
+            """,
+            (*categories, limit),
+        )
+        return [row[0] for row in self.cursor.fetchall()]
+
     # 规则系统
     def get_active_axioms(self):
         """组合并返回当前所有依然存活的规则供 Agent 使用"""
@@ -610,9 +665,10 @@ class DatabaseManager:
         return self.adjust_rule_weight(category, -0.2, "legacy_penalty")
 
     def apply_metric_feedback(self, audience_type, evaluation_metrics, book_id=None, chapter_index=None):
+        normalized_audience = normalize_audience_type(audience_type)
         demographic_root = (
             "demographic_quarantine_male"
-            if audience_type == "male_oriented"
+            if normalized_audience == "male_oriented"
             else "demographic_quarantine_female"
         )
         category_map = {
@@ -774,11 +830,11 @@ class DatabaseManager:
             (
                 book_id,
                 title,
-                genesis.get("audience_type"),
-                genesis.get("narrative_kernel"),
-                genesis.get("master_style"),
-                genesis.get("world_setting"),
-                genesis.get("initial_conflict"),
+                str(genesis.get("audience_type") or ""),
+                str(genesis.get("narrative_kernel") or ""),
+                str(genesis.get("master_style") or ""),
+                str(genesis.get("world_setting") or ""),
+                str(genesis.get("initial_conflict") or ""),
                 self._json_dumps(genesis),
                 self._json_dumps(skeleton),
                 status,
@@ -829,11 +885,11 @@ class DatabaseManager:
             (
                 book_id,
                 chapter_index,
-                title,
-                chapter_type,
+                str(title or ""),
+                str(chapter_type or ""),
                 self._json_dumps(skeleton_data or {}),
-                history_context,
-                status,
+                str(history_context or ""),
+                str(status or ""),
             ),
         )
         self.conn.commit()
@@ -845,13 +901,13 @@ class DatabaseManager:
         params = []
         if status is not None:
             fields.append("status = ?")
-            params.append(status)
+            params.append(str(status))
         if summary is not None:
             fields.append("summary = ?")
-            params.append(summary)
+            params.append(str(summary))
         if history_context is not None:
             fields.append("history_context = ?")
-            params.append(history_context)
+            params.append(str(history_context))
         if not fields:
             return
         fields.append("updated_at = CURRENT_TIMESTAMP")
@@ -898,7 +954,10 @@ class DatabaseManager:
         row = self.cursor.fetchone()
         if not row:
             return {}
-        return self._json_loads(row[0], {}) or {}
+        res = self._json_loads(row[0], {}) or {}
+        if not isinstance(res, dict):
+            return {}
+        return res
 
     def list_character_state_snapshots(self, book_id):
         self.cursor.execute("SELECT * FROM character_states WHERE book_id = ?", (book_id,))
@@ -1289,7 +1348,7 @@ class DatabaseManager:
         title_seed,
         total_chapters=10,
         priority=100,
-        candidate_count=2,
+        candidate_count=1,
         max_attempts=3,
         rate_limit_group="default",
     ):

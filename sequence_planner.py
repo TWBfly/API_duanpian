@@ -1,221 +1,310 @@
 from llm_client import generate_text
 import json
 import re
-
 import sys
+from logger import logger
+from novel_utils import (
+    chapter_title_for_index,
+    expected_chapter_indices,
+    normalize_total_chapters,
+    validate_skeleton_contract,
+)
 
 class SequencePlanner:
     """
-    工业级骨架引擎：在动笔前产出 11 段逻辑全景图 (楔子 + 10章)
-    确保因果锁死、伏笔预埋、以及状态转换。
+    工业级骨架引擎：在动笔前产出固定章节逻辑全景图 (楔子 + 10章)
+    采用【渐进式解构规划】：逐章推演，确保每一章的 acts 具备极致的独特性与因果律。
     """
     def __init__(self):
-        self.skeleton_prompt = """你是一个“高阶故事架构师代理”（Architect Agent）。
-你的任务是根据给定的世界观设定、主角初始状态和核心矛盾，为一个短篇小说产出详细的【逻辑骨架 JSON】。
+        self.step_skeleton_prompt = """你是一个“高阶故事架构师代理”（Architect Agent）。
+你的任务是为一个短篇小说规划【当前章节】的详细逻辑骨架。
 
-必须要规划的关键点：
-1. **结构要求**：严格按照要求的章节范围生成。
-2. **伏笔埋设与回收**：在早期章节点（如楔子或前三章）埋下伏笔，并在后期章节明确回收。
-3. **状态变迁**：跟踪主角的物理状态（受伤、获得武器、换马甲等）。
-4. **节奏控制**：确保【楔子】高危爆发，中间转折，结局合龙并首尾呼应。
+【当前目标】：规划第 {current_idx} 章
+【全书最终结局（不可偏离的目标）】：
+{global_resolution}
 
-输入环境设定：
+【先前已规划的剧情脉络】：
+{arc_history}
+
+【核心世界观设定】：
 {genesis_setting}
 
-输出格式（严格 JSON）：
+---
+【规划要求】：
+1. **场景具体化**：严禁模糊描述。必须提供具体、符合世界观的场景（如：翰林院东庑、落梅池边的石凳）。
+2. **三幕式行动段落 (Mandatory)**：必须通过 `acts` 字段拆解为三个具体的行动段落。
+   - 严禁：使用模板化词汇（如“寻找借力点”、“展开交锋”）。
+   - 必须：写出具体的、符合女频情感拉扯/男频逆袭质感的动作（如：“借由归还玉佩之机，在众目睽睽下点破对方身份穿帮”、“在岁末试上一字不差地默出从未公开的禁书残卷”）。
+3. **因果连续性**：本章必须承接上文，并为后续推演埋下逻辑引线。
+4. **受众倾向**：本次受众为 {audience}。请根据受众偏好调整侧重点。
+5. **题材底色**：{track_hint}。
+
+【起名/用词约束】：
+- 严禁出现任何科幻/现代术语（数据、流、系统、程序、实验室、芯片、逻辑、算法）。
+- 映射建议：主角的聪明才智映射为“玲珑心、博闻强记”；敌人的算计映射为“阴谋、局、杀机”。
+
+输出格式（严格返回一个 JSON 对象，不要包含其他键）：
 {{
-  "novel_arc": [
-    {{
-      "chapter_idx": 序号,
-      "title": "章节标题",
-      "plot_beat": "详细的情节爆点",
-      "foreshadowing_to_plant": "此处埋下的伏笔描述",
-      "state_transition": "本段后的主角状态变更"
-    }},
-    ... {chapter_range_desc}
-  ],
-  "global_resolution": "最终章节如何呼应楔子的具体设计"
+  "chapter_idx": {current_idx},
+  "title": "充满张力的本章标题",
+  "scene": "主场景具象化描述",
+  "acts": {{
+    "act_1": "起：本章冲突的引火点",
+    "act_2": "承/转：本章情感或局势的最高潮",
+    "act_3": "合：本章收尾的余韵或钩子"
+  }},
+  "characters": ["本章涉及的所有角色"],
+  "foreshadowing_to_plant": "此处埋下的具体伏笔（如：落在现场的一方手帕）",
+  "state_transition": "主角此时的处境/心境变化"
 }}
 """
 
-    def plan_novel_arc(self, genesis_setting):
-        print(f"\n📐 [Sequence Planner] 启动三阶段碎粒化推演模式 (楔子 + 10章)...")
-        sys.stdout.flush()
-        
-        # 阶段 1: 楔子 + 前三章 (0-3)
-        print(f"   [Phase 1] 正在构思核心开局 (楔子 + 1-3章)...")
-        sys.stdout.flush()
-        p1_prompt = self.skeleton_prompt.format(genesis_setting=json.dumps(genesis_setting, ensure_ascii=False), chapter_range_desc="只生成第0章(楔子)到第3章。不要生成后面的章节。")
-        
-        p1_response = generate_text(p1_prompt, "You are a master literary architect. Output ONLY valid JSON.")
-        arc_p1 = self._parse_partial_json(p1_response)
-        
-        if not arc_p1 or "novel_arc" not in arc_p1:
-            print("⚠️ [Phase 1] 失败，尝试进入兜底逻辑。")
-            sys.stdout.flush()
-            return self._get_fallback_arc(genesis_setting)
+    def plan_novel_arc(self, genesis_setting, anti_plagiarism_context="", total_chapters=10):
+        total_chapters = normalize_total_chapters(total_chapters)
+        expected_indices = expected_chapter_indices(total_chapters)
+        total_sections = len(expected_indices)
+        final_title = chapter_title_for_index(total_chapters)
 
-        # 阶段 2: 中场四章 (4-7)
-        print(f"   [Phase 2] 正在构思中场转折 (4-7章)...")
+        print(f"\n📐 [Sequence Planner] 开启“全局逻辑底片 + 上帝视角并发扩写”模式 (共 {total_sections} 段)...")
         sys.stdout.flush()
-        p2_prompt = self.skeleton_prompt.format(
-            genesis_setting=f"【世界观设定】：\n{json.dumps(genesis_setting, ensure_ascii=False)}\n\n【已有前期骨架(0-3章)】：\n{json.dumps(arc_p1['novel_arc'], ensure_ascii=False)}",
-            chapter_range_desc="基于已有前期骨架，请只生成第4章到第7章。延续伏笔，推进矛盾升级。不要生成其他章节。"
+
+        from llm_client import generate_text
+        import concurrent.futures
+
+        # ---------------------------------------------------------
+        # 第一阶段：生成【全局逻辑底片】（包含人物、道具、伏笔流转）
+        # ---------------------------------------------------------
+        beat_sheet_prompt = f"""请根据以下设定，推演全书 {total_sections} 段的逻辑底片。
+设定：{json.dumps(genesis_setting, ensure_ascii=False)}
+{anti_plagiarism_context}
+
+请严格按以下格式输出（纯文本，绝不要 JSON），这决定了全书的因果闭环：
+全局结局：[描述最终结局与核心反转点]
+
+[章节逻辑流转]：
+第0章：[标题] | 剧情：[核心动作] | 人物：[主要登场] | 道具伏笔：[本章关键物件或埋下的雷]
+第1章：[标题] | 剧情：[核心动作] | 人物：[主要登场] | 道具伏笔：[物件流转或新埋伏笔]
+... (请务必写完 0 到 {total_chapters} 章)
+第{total_chapters}章：[标题] | 剧情：[终极冲突、真相揭示、反派清算、主角命运定格] | 人物：[主要登场] | 道具伏笔：[全书伏笔终极收束，严禁新增续章钩子]
+
+注意：请确保人物的行为逻辑一致，道具的出现和消失必须有因果，伏笔必须在后文有呼应。"""
+
+        print(f"   [阶段1] 正在绘制 {total_sections} 段全局逻辑底片（因果链条构建中）...")
+        sys.stdout.flush()
+        
+        master_logic_map = ""
+        for attempt in range(3):
+            try:
+                master_logic_map = generate_text(beat_sheet_prompt, "You are a master story architect. Build a consistent causal chain.")
+                if final_title in master_logic_map:
+                    break
+            except Exception as e:
+                print(f"      ⚠️ 第一阶段主线生成异常: {e}")
+
+        # ---------------------------------------------------------
+        # 第二阶段：带上【上帝视角】进行并发扩写
+        # ---------------------------------------------------------
+        track_hint = "古代背景" if "古代" in str(genesis_setting.get("world_setting", "")) else "现代背景"
+        audience = genesis_setting.get("audience_type", "女频")
+        
+        def expand_chapter(idx):
+            # 关键：每一章扩写时，都把全书逻辑底片塞进去
+            if idx == total_chapters:
+                chapter_mission = (
+                    f"这是第{total_chapters}章，也是全书大结局。JSON 必须把 goal 写成终章收束目标；"
+                    "acts.act_1 必须引爆终极冲突，acts.act_2 必须揭示核心真相并清算主要反派，"
+                    "acts.act_3 必须完成首尾呼应、主角命运定格、全书落幕。"
+                    "foreshadowing_to_plant 必须写“终章不新增伏笔；只回收、揭示、清算、定格。”"
+                )
+                act_3_hint = "合：完成首尾呼应、全书伏笔回收、主角命运定格，确定性落幕"
+                clue_hint = "终章不新增伏笔；只回收、揭示、清算、定格。"
+            else:
+                chapter_mission = "本章必须承接前文，并为后续推演埋下逻辑引线。"
+                act_3_hint = "合：本章收尾的余韵或钩子"
+                clue_hint = "本章埋下或收回的伏笔描述"
+            p_prompt = f"""你是一个高阶故事架构师。请根据【全局逻辑底片】，将【第{idx}章】扩写为详细 JSON。
+
+【全局上帝视角 - 逻辑底片】：
+{master_logic_map}
+
+【世界观设定】：{json.dumps(genesis_setting, ensure_ascii=False)[:400]}
+
+任务：
+1. 严格遵循逻辑底片中对第{idx}章的规划。
+2. **因果对齐**：检查前文章节（0到{idx-1}章）的道具和伏笔，若逻辑底片要求在本章收束，请务必在 acts 中体现。
+3. **环境渲染**：场景需具象化，动作需符合{audience}受众偏好。
+4. **本章任务**：{chapter_mission}
+
+输出 JSON 格式：
+{{
+  "chapter_idx": {idx},
+  "title": "章节标题",
+  "goal": "本章核心目标",
+  "scene": "主场景具象化描述",
+  "acts": {{
+    "act_1": "起：本章冲突的引火点",
+    "act_2": "承/转：本章情感或局势的最高潮",
+    "act_3": "{act_3_hint}"
+  }},
+  "characters": ["本章角色列表"],
+  "foreshadowing_to_plant": "{clue_hint}",
+  "state_transition": "主角状态变化"
+}}
+"""
+            return self._generate_single_step_with_retry(
+                idx,
+                p_prompt,
+                genesis_setting,
+                "逻辑一致性扩写",
+                retries=3,
+                total_chapters=total_chapters,
+            )
+
+        novel_arc = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_idx = {executor.submit(expand_chapter, i): i for i in expected_indices}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    chapter_data = future.result()
+                    if chapter_data:
+                        novel_arc.append(chapter_data)
+                        print(f"      ✔️ 第 {idx} 章逻辑细节扩写完成")
+                except Exception as e:
+                    print(f"      ⚠️ 第 {idx} 章扩写失败: {e}")
+                    novel_arc.append(self._get_fallback_chapter(idx, genesis_setting, "逻辑兜底", total_chapters=total_chapters))
+
+        novel_arc.sort(key=lambda x: x["chapter_idx"])
+        
+        # 提取结局描述
+        res_match = re.search(r"全局结局：(.*?)(?=\n\[章节逻辑流转\]|$)", master_logic_map, re.DOTALL)
+        final_resolution = res_match.group(1).strip() if res_match else "圆满收官"
+
+        result = validate_skeleton_contract(
+            {
+                "global_resolution": final_resolution,
+                "novel_arc": novel_arc
+            },
+            total_chapters=total_chapters,
         )
-        p2_response = generate_text(p2_prompt, "You are a master literary architect. Output ONLY valid JSON.")
-        arc_p2 = self._parse_partial_json(p2_response)
 
-        if not arc_p2 or "novel_arc" not in arc_p2:
-            print("⚠️ [Phase 2] 失败，仅保留前期逻辑。")
-            sys.stdout.flush()
-            return arc_p1
-
-        # 阶段 3: 后三章 + 终局 (8-10)
-        print(f"   [Phase 3] 正在构思终局合龙 (8-10章)...")
+        print(f"✅ [高并发规划成功] {total_sections} 段精密大纲已通过上帝视角模式极速交付！")
         sys.stdout.flush()
-        p3_prompt = self.skeleton_prompt.format(
-            genesis_setting=f"【世界观设定】：\n{json.dumps(genesis_setting, ensure_ascii=False)}\n\n【已有骨架(0-7章)】：\n{json.dumps(arc_p1['novel_arc'] + arc_p2['novel_arc'], ensure_ascii=False)}",
-            chapter_range_desc="基于已有骨架，请只生成第8章到第10章。确保在第10章完成终极合龙，并包含 global_resolution。"
-        )
-        p3_response = generate_text(p3_prompt, "You are a master literary architect. Output ONLY valid JSON.")
-        arc_p3 = self._parse_partial_json(p3_response)
+        return result
 
-        if not arc_p3 or "novel_arc" not in arc_p3:
-            print("⚠️ [Phase 3] 失败，保留前 8 段逻辑。")
+    def _generate_single_step_with_retry(self, idx, prompt, genesis_setting, global_resolution, retries=3, total_chapters=10):
+        total_chapters = normalize_total_chapters(total_chapters)
+        for attempt in range(retries):
+            try:
+                response = generate_text(prompt, "Output ONLY valid JSON object.", task_profile="planner_json")
+                parsed = self._parse_json_object(response)
+                if parsed and int(parsed.get("chapter_idx")) == idx:
+                    parsed["chapter_idx"] = idx
+                    return parsed
+                print(f"      ⚠️ 第 {idx} 章第 {attempt+1} 次尝试解析失败或索引不符，正在重试...")
+            except Exception as e:
+                print(f"      ⚠️ 第 {idx} 章尝试 {attempt+1} 抛出异常: {e}")
             sys.stdout.flush()
-            combined_arc = {
-                "novel_arc": arc_p1["novel_arc"] + arc_p2["novel_arc"],
-                "global_resolution": "待定"
-            }
-            return combined_arc
+        
+        # 如果重试均失败，使用更智能一点的紧急方案，而不是全重复
+        return self._get_fallback_chapter(idx, genesis_setting, global_resolution, total_chapters=total_chapters)
 
-        # 合并结果
-        combined_arc = {
-            "novel_arc": arc_p1["novel_arc"] + arc_p2["novel_arc"] + arc_p3["novel_arc"],
-            "global_resolution": arc_p3.get("global_resolution", "圆满收官。")
-        }
-        print(f"✅ [骨架全量推演成功] 楔子+10章全景图已锁死。")
-        sys.stdout.flush()
-        return combined_arc
+    def _generate_with_retry(self, prompt, system_msg, retries=3):
+        for attempt in range(retries):
+            try:
+                res = generate_text(prompt, system_msg)
+                if res and len(res.strip()) > 10:
+                    return res
+            except Exception as e:
+                print(f"      ⚠️ 生成尝试 {attempt+1} 失败: {e}")
+        return "圆满收官。"
 
-    def _parse_partial_json(self, response):
-        """支持清洗、修复截断并提取第一个合法的 JSON 块"""
+    def _parse_json_object(self, response):
         try:
             if not response or not isinstance(response, str):
                 return None
-            
-            # 找到第一个 { 
-            start_idx = response.find('{')
-            if start_idx == -1:
-                return None
-            
-            # 找到最后一个 }
-            end_idx = response.rfind('}')
-            
-            # 核心容错：如果没找到 } 或者 JSON 被截断
-            if end_idx == -1 or end_idx < start_idx:
-                # 尝试通过补完括号来修复截断的 JSON
-                return self._repair_json(response[start_idx:])
-            
-            potential_json = response[start_idx:end_idx+1]
-            
-            # 尝试逐步修复/缩减
-            while potential_json:
-                try:
-                    return json.loads(potential_json)
-                except json.JSONDecodeError as e:
-                    # 如果报错是由于截断，尝试补完
-                    if "Expecting" in str(e) or "Unterminated" in str(e):
-                        repaired = self._repair_json(potential_json)
-                        if repaired: return repaired
-                    
-                    # 如果是 Extra Data，尝试缩减尾部
-                    if "Extra data" in str(e):
-                        end_idx = potential_json.rfind('}', 0, -1)
-                        if end_idx == -1: break
-                        potential_json = potential_json[:end_idx+1]
-                    else:
-                        break
-            return None
-        except Exception as e:
-            print(f"   ❌ JSON 深度解析/修复失败: {e}")
-            sys.stdout.flush()
+            match = re.search(r'\{.*\}', response, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        except:
+            pass
         return None
 
-    def _repair_json(self, truncated_str):
-        """暴力尝试修复截断的 JSON 结构"""
-        # 统计未闭合的括号
-        stack = []
-        for char in truncated_str:
-            if char == '{': stack.append('}')
-            elif char == '[': stack.append(']')
-            elif char == '}' or char == ']':
-                if stack and stack[-1] == char:
-                    stack.pop()
+    def _get_fallback_chapter(self, idx, genesis_setting, global_resolution, total_chapters=10):
+        """兜底逻辑也需要一点灵性"""
+        total_chapters = normalize_total_chapters(total_chapters)
+        mc_name = genesis_setting.get("main_character", {}).get("name", "主角")
+        world_setting = str(genesis_setting.get("world_setting", ""))
+        is_ancient = "古代" in world_setting or "书院" in world_setting or "修仙" in world_setting
         
-        # 倒序补完
-        repaired_str = truncated_str
-        while stack:
-            repaired_str += stack.pop()
-            try:
-                data = json.loads(repaired_str)
-                return data
-            except:
-                continue
-        return None
+        is_prologue = idx == 0
+        is_final = idx == total_chapters
+        title = "阶段性进展"
+        if is_prologue:
+            title = "序章：宿命开启"
+        elif is_final:
+            title = "终章：尘埃落定"
 
-    def replan_novel_arc(self, genesis_setting, current_arc, current_idx, new_state, new_clue):
-        print(f"\n🦋 [Sequence Replanner] 触发蝴蝶效应！基于第 {current_idx} 章的突变进行后续大纲重铸...")
-        prompt = f"""你是一个“高阶故事架构师代理”。
-目前小说刚完成了第 {current_idx} 章。在这个过程中发生了意外偏离或产生了重大新线索。
-为了保证逻辑严密，你需要重新规划第 {current_idx + 1} 章到最终章的大纲。
-
-【初始世界观设定】：
-{json.dumps(genesis_setting, ensure_ascii=False)}
-
-【之前的大纲】：
-{json.dumps(current_arc, ensure_ascii=False)}
-
-【最新状态突变】：
-主角当前最新状态：{new_state}
-本章新产生的重大(S级)伏笔/线索：{new_clue}
-
-输出格式同样为严格的 JSON (只需返回剩余章节和结局，以及一个融合了旧章节的新完整列表)：
-{{
-  "novel_arc": [
-    ...从第1章到最后一章的完整列表...
-  ],
-  "global_resolution": "更新后的最终结局。"
-}}
-"""
-        response = generate_text(prompt, "You are a master literary architect. Output ONLY valid JSON.")
-        arc = self._parse_partial_json(response)
-        if arc:
-            print(f"✅ [大纲重铸成功] 蝴蝶效应生效，后续因果图景已更新。")
-            return arc
+        if is_final:
+            acts = {
+                "act_1": f"{mc_name}直面最终阻力，公开引爆全书核心冲突。",
+                "act_2": f"围绕结局“{global_resolution[:40]}”完成真相揭示、证据落地与反派清算。",
+                "act_3": "主角命运定格，核心伏笔闭环，全书在确定性的最终画面中结束。",
+            }
+            foreshadowing = "终章不新增伏笔；只回收、揭示、清算、定格。"
+            state_transition = "主角完成最终蜕变，故事闭环。"
         else:
-            print(f"⚠️ [Replanner] 重铸失败。保留原有大纲。")
-            return current_arc
+            acts = {
+                "act_1": f"{mc_name}在关键时刻察觉到了局势的微妙变化。",
+                "act_2": f"双方在当前场景下产生了一场无法回避的争锋（基于结局：{global_resolution[:20]}...）。",
+                "act_3": f"事态暂时平息，但留下了更深的阴影。"
+            }
+            foreshadowing = "无"
+            state_transition = "处境更加紧迫"
 
-    def _get_fallback_arc(self, genesis_setting):
-        # 兜底逻辑：线性推进
-        arc = {"novel_arc": []}
-        # 第0段：楔子
-        arc["novel_arc"].append({
-            "chapter_idx": 0,
-            "title": "楔子",
-            "plot_beat": "线性开局",
-            "foreshadowing_to_plant": "无",
-            "state_transition": "无"
-        })
-        # 第1-10段
-        for i in range(1, 11):
-            arc["novel_arc"].append({
-                "chapter_idx": i,
-                "title": f"第{i}章",
-                "plot_beat": "线性剧情推进",
-                "foreshadowing_to_plant": "无",
-                "state_transition": "无"
-            })
-        arc["global_resolution"] = "线性结局。"
-        return arc
+        return {
+            "chapter_idx": idx,
+            "title": f"{title}(自适应补全)",
+            "scene": world_setting[:50],
+            "acts": acts,
+            "characters": [mc_name],
+            "foreshadowing_to_plant": foreshadowing,
+            "state_transition": state_transition
+        }
+
+    def replan_novel_arc(self, genesis_setting, current_arc, current_idx, new_state, new_clue, anti_plagiarism_context="", total_chapters=10):
+        """局部重塑也改为逐章模式"""
+        total_chapters = normalize_total_chapters(total_chapters)
+        print(f"\n🦋 [Sequence Replanner] 正在执行逐章重塑流程...")
+        sys.stdout.flush()
+        
+        global_resolution = current_arc.get("global_resolution", "圆满收官。")
+        novel_arc = current_arc.get("novel_arc", [])[:current_idx + 1]
+        track_hint = "古代背景" if "古代" in str(genesis_setting.get("world_setting", "")) else "现代背景"
+        audience = genesis_setting.get("audience_type", "女频")
+
+        for i in range(current_idx + 1, total_chapters + 1):
+            print(f"   [Replan Chapter {i}/{total_chapters}] 逻辑修正中...")
+            arc_history = json.dumps(novel_arc[-2:], ensure_ascii=False)
+            mutation_info = f"【状态突变】：{json.dumps(new_state, ensure_ascii=False)}\n【关键新线索】：{new_clue}"
+            
+            p_prompt = self.step_skeleton_prompt.format(
+                current_idx=i,
+                global_resolution=global_resolution,
+                arc_history=arc_history,
+                genesis_setting=f"{json.dumps(genesis_setting, ensure_ascii=False)}\n{mutation_info}",
+                audience=audience,
+                track_hint=track_hint
+            )
+            
+            chapter_data = self._generate_single_step_with_retry(
+                i,
+                p_prompt,
+                genesis_setting,
+                global_resolution,
+                total_chapters=total_chapters,
+            )
+            novel_arc.append(chapter_data)
+            sys.stdout.flush()
+
+        return validate_skeleton_contract({"novel_arc": novel_arc, "global_resolution": global_resolution}, total_chapters=total_chapters)

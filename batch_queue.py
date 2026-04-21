@@ -9,6 +9,7 @@ from chapter_director import ChapterDirector
 from chroma_memory import ChromaMemory
 from db import DatabaseManager
 from neo4j_db import Neo4jManager
+from novel_utils import normalize_total_chapters
 
 
 class SQLiteTaskWorker:
@@ -36,11 +37,12 @@ class SQLiteTaskWorker:
         title_seeds,
         total_chapters=10,
         priority=100,
-        candidate_count=2,
+        candidate_count=1,
         max_attempts=3,
         rate_limit_group="default",
     ):
         queued = []
+        total_chapters = normalize_total_chapters(total_chapters)
         for offset, title_seed in enumerate(title_seeds):
             book_id = f"BOOK-{uuid.uuid4().hex[:12]}"
             task_id = self.db.enqueue_generation_task(
@@ -145,13 +147,14 @@ class SQLiteTaskWorker:
 
     def _execute_director(self, task, workspace_dir):
         task_db = DatabaseManager(self.db.db_path)
+        total_chapters = normalize_total_chapters(task["total_chapters"])
         director = ChapterDirector(
             novel_id=task["book_id"],
             novel_name=task["title_seed"],
-            total_chapters=task["total_chapters"],
+            total_chapters=total_chapters,
             db_manager=task_db,
             run_autonomous_learning=False,
-            candidate_count=task.get("candidate_count", 2),
+            candidate_count=task.get("candidate_count", 1),
             workspace_dir=workspace_dir,
             isolated_task_mode=True,
         )

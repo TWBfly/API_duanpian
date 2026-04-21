@@ -29,3 +29,7 @@ state/
 
 # OS
 .DS_Store
+
+# SQLite WAL and SHM files
+*.db-shm
+*.db-wal

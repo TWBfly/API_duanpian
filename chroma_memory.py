@@ -1,6 +1,63 @@
 import chromadb
 import uuid
+import os
 from pathlib import Path
+
+
+class InMemoryCollection:
+    def __init__(self):
+        self.items = []
+
+    def count(self):
+        return len(self.items)
+
+    def add(self, documents, metadatas, ids):
+        for document, metadata, item_id in zip(documents, metadatas, ids):
+            self.items.append({
+                "id": item_id,
+                "document": document,
+                "metadata": metadata or {},
+            })
+
+    def query(self, query_texts, n_results=1, where=None):
+        query = query_texts[0] if query_texts else ""
+        filtered = [item for item in self.items if _metadata_match(item["metadata"], where)]
+        ranked = sorted(
+            filtered,
+            key=lambda item: _simple_similarity(query, item["document"]),
+            reverse=True,
+        )[:n_results]
+        documents = [item["document"] for item in ranked]
+        metadatas = [item["metadata"] for item in ranked]
+        distances = [1.0 - _simple_similarity(query, item["document"]) for item in ranked]
+        return {
+            "documents": [documents],
+            "metadatas": [metadatas],
+            "distances": [distances],
+        }
+
+    def delete(self, where=None):
+        self.items = [item for item in self.items if not _metadata_match(item["metadata"], where)]
+
+
+def _metadata_match(metadata, where):
+    if not where:
+        return True
+    for key, value in where.items():
+        if metadata.get(key) != value:
+            return False
+    return True
+
+
+def _simple_similarity(left, right):
+    left_set = set((left or "").split())
+    right_set = set((right or "").split())
+    if not left_set or not right_set:
+        left_set = set(left or "")
+        right_set = set(right or "")
+    if not left_set or not right_set:
+        return 0.0
+    return len(left_set & right_set) / len(left_set | right_set)
 
 class SafeEmbeddingFunction(chromadb.EmbeddingFunction):
     """
@@ -28,8 +85,37 @@ class ChromaMemory:
     def __init__(self, db_path=None):
         if db_path is None:
             db_path = Path(__file__).resolve().parent / ".chroma_db"
-        self.client = chromadb.PersistentClient(path=str(db_path))
+        self.client = None
+        self.plot_collection = None
+        self.reference_collection = None
         
+        # 工业化加固：预检查物理数据库健康度，防止 Rust 层直接 Panic
+        db_path_obj = Path(db_path)
+        if db_path_obj.exists():
+            # 检查是否可写，以及是否存在明显的锁定文件
+            if not os.access(db_path, os.W_OK):
+                print(f"⚠️ [向量库] 数据库目录 {db_path} 权限不足，降级到 InMemoryMode。")
+                self._init_in_memory()
+                return
+
+        try:
+            self.client = chromadb.PersistentClient(path=str(db_path))
+            self._init_collections()
+        except BaseException as e:
+            error_str = str(e)
+            print(f"⚠️ [环境修复] PersistentClient 初始化失败 ({error_str})")
+            if "range start index" in error_str or "panic" in error_str.lower():
+                print("💡 [诊断报告] 检测到底层 Rust/SQLite 数据损坏。建议：手动删除 '.chroma_db' 文件夹后重启系统。")
+            
+            print("🔄 [自动降级] 正在切换到 InMemoryVectorMode 以保证业务不中断...")
+            self._init_in_memory()
+            return
+
+    def _init_in_memory(self):
+        self.plot_collection = InMemoryCollection()
+        self.reference_collection = InMemoryCollection()
+
+    def _init_collections(self):
         # 1. 甄别可用 Embedding 引擎
         embedding_function = None
         try:
@@ -45,12 +131,22 @@ class ChromaMemory:
             embedding_function = SafeEmbeddingFunction()
             
         # 2. 挂载集合
-        self.plot_collection = self.client.get_or_create_collection(
-            name="plot_memory",
-            embedding_function=embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
-        print("✅ [本地向量库] 剧情记忆集合就绪。")
+        try:
+            self.plot_collection = self.client.get_or_create_collection(
+                name="plot_memory",
+                embedding_function=embedding_function,
+                metadata={"hnsw:space": "cosine"}
+            )
+            self.reference_collection = self.client.get_or_create_collection(
+                name="reference_memory",
+                embedding_function=embedding_function,
+                metadata={"hnsw:space": "cosine"}
+            )
+            print("✅ [本地向量库] 剧情记忆集合就绪。")
+        except BaseException as e:
+            print(f"⚠️ [环境修复] Collection 初始化失败 ({e})，切换到 InMemoryVectorMode。")
+            self.plot_collection = InMemoryCollection()
+            self.reference_collection = InMemoryCollection()
 
     def search_similar_plot(self, plot_text, top_k=1, threshold=0.75, where_filter=None):
         """撞库：查询是否存在高相似度的套路桥段"""
@@ -93,6 +189,39 @@ class ChromaMemory:
             ids=[str(uuid.uuid4())]
         )
 
+    def add_reference_chunk(self, text, metadata=None):
+        if not metadata:
+            metadata = {"source": "reference_chunk"}
+        self.reference_collection.add(
+            documents=[text],
+            metadatas=[metadata],
+            ids=[str(uuid.uuid4())]
+        )
+
+    def search_similar_reference(self, text, top_k=1, threshold=0.85, where_filter=None):
+        if self.reference_collection.count() == 0:
+            return None, 0.0, None
+
+        kwargs = {
+            "query_texts": [text],
+            "n_results": top_k,
+        }
+        if where_filter:
+            kwargs["where"] = where_filter
+
+        results = self.reference_collection.query(**kwargs)
+        distances = results["distances"][0]
+        documents = results["documents"][0]
+        metadatas = results.get("metadatas", [[]])[0]
+        if not distances:
+            return None, 0.0, None
+
+        similarity = 1.0 - distances[0]
+        if similarity >= threshold:
+            metadata = metadatas[0] if metadatas else None
+            return documents[0], similarity, metadata
+        return None, similarity, None
+
     def remove_novel_plots(self, novel_id):
         """删除失败任务为某本书写入的向量记忆。"""
         if not novel_id:
@@ -101,4 +230,12 @@ class ChromaMemory:
             self.plot_collection.delete(where={"novel_id": novel_id})
         except Exception:
             # Chroma 清理失败不应阻断主流程，调用方会继续做 SQL/文件回滚。
+            pass
+
+    def remove_reference_chunks(self, book_id):
+        if not book_id:
+            return
+        try:
+            self.reference_collection.delete(where={"book_id": book_id})
+        except Exception:
             pass

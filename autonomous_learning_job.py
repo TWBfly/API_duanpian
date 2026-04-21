@@ -1,6 +1,8 @@
 import os
 import glob
 import time
+import json
+import re
 from pathlib import Path
 from db import DatabaseManager
 from llm_client import generate_text_safe
@@ -66,8 +68,8 @@ class AutonomousLearningEngine:
             print(f"\n✔️ [无新进展] 所有典籍均已倒背如流。")
 
     def run_skill_evolution_flywheel(self):
-        """核心飞轮：将生产环境的'神修改'对提取为 Skill Few-Shot 样本"""
-        print("\n⚙️ [技能进化飞轮启动] 正在提取生产环节中的黄金样本...")
+        """核心飞轮：将生产环境的配对样本蒸馏为抽象技能规则，而非全文样本回灌。"""
+        print("\n⚙️ [技能进化飞轮启动] 正在提取生产环节中的抽象技能规则...")
         pairs = self.db.get_pending_learning_pairs(limit=20, purpose="skill")
         if not pairs:
             print(">> [飞轮静默] 暂无待处理的学习配对数据。")
@@ -87,26 +89,50 @@ class AutonomousLearningEngine:
                 # 2. 判别受众
                 audience = self._classify_audience(p['final_text'])
                 
-                # 3. 计算评分 (简化处理，既然入了 pair 库且是 final，默认为高分结晶)
-                score = 1.8 if p['pair_source'] == "human_revision" else 1.2
-                
-                # 4. 入库专家案例
-                self.db.add_expert_sample(
-                    category=category,
-                    audience=audience,
-                    original_text=p['draft_text'],
-                    improved_text=p['final_text'],
-                    score=score,
-                    source=p['pair_source']
-                )
+                rule_prompt = f"""
+                你正在分析一组网文修订配对。
+                任务：只提炼 1 到 2 条可以泛化复用的【技能规则】。
+                要求：
+                1. 只输出指令体，不要引用原文具体句子或专名。
+                2. 每条规则不超过 40 字。
+                3. 输出严格 JSON：{{"rules":["...","..."]}}
+
+                【AI草稿】
+                {p['draft_text'][:1000]}
+
+                【人类终稿】
+                {p['final_text'][:1000]}
+                """
+                response = generate_text_safe(rule_prompt, "You are a skill rule distiller. Return only JSON.")
+                match = re.search(r"\{.*\}", response or "", re.DOTALL)
+                rules = []
+                if match:
+                    try:
+                        payload = json.loads(match.group(0))
+                    except Exception:
+                        payload = {}
+                    raw_rules = payload.get("rules") if isinstance(payload, dict) else []
+                    if isinstance(raw_rules, list):
+                        rules = [str(item).strip() for item in raw_rules if str(item).strip()]
+
+                if not rules:
+                    print(f"   ⚠️ [进化中断] 配对 ID {p['id']} 未能蒸馏出技能规则。")
+                    continue
+
+                category_key = f"skill_rule_{category}"
+                if audience in {"male_oriented", "female_oriented", "general"}:
+                    category_key = f"{category_key}_{audience}"
+
+                for rule in rules[:2]:
+                    self.db.add_dynamic_rule(category_key, rule, initial_weight=1.1)
                 
                 # 5. 标记处理完成
                 self.db.mark_learning_pair_processed(
                     p['id'],
-                    {"action": "evolved_to_skill", "category": category},
+                    {"action": "distilled_skill_rules", "category": category, "rules": rules[:2]},
                     purpose="skill",
                 )
-                print(f"   => ✨ [进化结晶] 已将第 {p['chapter_index']} 章配对入库为 '{category}' 技能案例。")
+                print(f"   => ✨ [进化结晶] 已将第 {p['chapter_index']} 章配对蒸馏为 '{category}' 抽象规则。")
                 evolved_count += 1
             except Exception as e:
                 print(f"   ⚠️ [进化中断] 处理配对 ID {p['id']} 失败: {e}")

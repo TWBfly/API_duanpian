@@ -2,6 +2,7 @@ import os
 import argparse
 import concurrent.futures
 from unified_entry import run_path_1_reference
+from novel_utils import normalize_total_chapters
 
 def run_batch_reference(directory, chapters=10, max_workers=2):
     """
@@ -10,6 +11,8 @@ def run_batch_reference(directory, chapters=10, max_workers=2):
     chapters: 每本书生成的章节数
     max_workers: 同时进行的任务数（建议不要超过 3，因为内部还有并发）
     """
+    chapters = normalize_total_chapters(chapters)
+
     if not os.path.exists(directory):
         print(f"❌ 目录不存在: {directory}")
         return
@@ -36,8 +39,11 @@ def run_batch_reference(directory, chapters=10, max_workers=2):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="短篇小说 API 进化系统 - 工业级并发运行工具")
     parser.add_argument("--dir", type=str, required=True, help="存放原著文件的目录")
-    parser.add_argument("--chapters", type=int, default=10, help="每本书生成的章节数")
+    parser.add_argument("--chapters", type=int, default=10, help="每本书主线章节数，楔子另算；短篇系统上限为10")
     parser.add_argument("--workers", type=int, default=2, help="同时生产的书籍数量")
 
     args = parser.parse_args()
-    run_batch_reference(args.dir, args.chapters, args.workers)
+    try:
+        run_batch_reference(args.dir, args.chapters, args.workers)
+    except ValueError as exc:
+        print(f"❌ 参数错误：{exc}")

@@ -1,5 +1,7 @@
 import re
 
+from novel_utils import extract_skeleton_plot_hint, normalize_audience_type
+
 
 class QuantitativeEvaluator:
     AI_FLAVOR_TERMS = [
@@ -103,8 +105,9 @@ class QuantitativeEvaluator:
         return round(min(100.0, score), 2)
 
     def _score_audience(self, text, audience_type, audit_text):
-        terms = self.FEMALE_TERMS if audience_type == "female_oriented" else self.MALE_TERMS
-        opposing = self.MALE_TERMS if audience_type == "female_oriented" else self.FEMALE_TERMS
+        normalized_audience = normalize_audience_type(audience_type)
+        terms = self.FEMALE_TERMS if normalized_audience == "female_oriented" else self.MALE_TERMS
+        opposing = self.MALE_TERMS if normalized_audience == "female_oriented" else self.FEMALE_TERMS
         matched = sum(1 for term in terms if term in text)
         opposing_hits = sum(1 for term in opposing if term in text)
         score = 62.0
@@ -179,7 +182,7 @@ class QuantitativeEvaluator:
         return round(min(100.0, score), 2)
 
     def _score_coherence(self, text, skeleton_data):
-        plot_hint = (skeleton_data or {}).get("plot_beat", "")
+        plot_hint = extract_skeleton_plot_hint(skeleton_data)
         score = 70.0
         if plot_hint:
             tokens = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]{2,}", plot_hint)
