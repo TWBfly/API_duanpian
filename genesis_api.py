@@ -137,7 +137,7 @@ class GenesisDirector:
         # 转换受众标签
         forced_audience = ""
         if target_audience:
-            audience_label = "女频" if target_audience == "female" else "男频"
+            audience_label = "女频" if "female" in target_audience or "女" in target_audience else "男频"
             forced_audience = f"\n- **受众强制要求**：本书必须设定为 **{audience_label}** 风格。"
 
         background_req = "**古代书院（如翰林院、国子监、私人顶级书院等）**"

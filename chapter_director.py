@@ -28,13 +28,7 @@ from reference_guard import HardReferenceGuard
 from sequence_planner import SequencePlanner
 
 from prompts_config import (
-    PROLOGUE_PROMPT_TEMPLATE,
-    CHAPTER_PROMPT_TEMPLATE,
-    EPILOGUE_PROMPT_TEMPLATE,
-    CONTINUITY_BLOCK_TEMPLATE,
-    NEXT_CHAPTER_TRANSITION_TEMPLATE,
-    TERMINAL_CHAPTER_CLOSURE_TEMPLATE,
-    FINAL_EXECUTION_TEMPLATE,
+    get_v3_prompt_bundle
 )
 
 class ChapterDirector:
@@ -415,134 +409,22 @@ class ChapterDirector:
         preview_mode=False,
         recent_plots_override=None,
     ):
-        # guide is moved to evolution_api system_prompt for caching
-        guide = ""
+        # 5. 合成最终执行 Prompt (使用 V3 统一引擎)
+        actual_title = chapter_skeleton.get('title', chapter_title_for_index(chapter_idx))
+        chapter_outline = str(chapter_skeleton)
         
-        # 1. 自动画像识别背景信息
-        global_resolution = self.skeleton.get("global_resolution", "圆满收官。")
-        background_info = f"【核心冲突】：{self.setting.get('initial_conflict', '尚未爆发')}\n【全书终极目标/结局】：{global_resolution}\n"
-        
-        # 2. 连续性档案构建
-        continuity_block = self._build_continuity_context(
-            chapter_idx,
-            history_context=history_context,
-            preview_mode=preview_mode,
-            recent_plots_override=recent_plots_override,
-        )
-        
-        # 3. 组合基础前缀
-        if chapter_type == "prologue":
-            base = PROLOGUE_PROMPT_TEMPLATE.format(guide=guide, background_info=background_info)
-        elif chapter_type == "epilogue":
-            base = EPILOGUE_PROMPT_TEMPLATE.format(
-                summary_prefix="",
-                chapter_num=num_to_chinese(chapter_idx),
-                guide=guide,
-                background_info=background_info,
-            )
-        else:
-            base = CHAPTER_PROMPT_TEMPLATE.format(
-                summary_prefix="",
-                chapter_num=num_to_chinese(chapter_idx),
-                guide=guide,
-                background_info=background_info
-            )
-
-        # 4. 下一章预告 (Transition Block)
-        transition_block = ""
-        if chapter_type == "epilogue":
-            transition_block = TERMINAL_CHAPTER_CLOSURE_TEMPLATE
-        elif next_chapter_skeleton:
-            next_title = next_chapter_skeleton.get('title', '待定')
-            next_scene = next_chapter_skeleton.get('scene', '未知场景')
-            next_hook = next_chapter_skeleton.get('foreshadowing_to_plant') or extract_skeleton_plot_hint(next_chapter_skeleton) or "保留通往下章的因果接口"
-            next_outline = f"第{chapter_idx+1}章《{next_title}》 | 场景锚点：{next_scene} | 保留的转场理由：{str(next_hook)[:80]}"
-            transition_block = NEXT_CHAPTER_TRANSITION_TEMPLATE.format(next_chapter_outline=next_outline)
-
-        # 5. 合成最终执行 Prompt
-        title = chapter_title_for_index(chapter_idx)
-        actual_title = chapter_skeleton.get("title") or title
-        title_instr = f"标题固定为‘{actual_title}’" if chapter_idx > 0 else "标题固定为‘楔子’"
-        
-        chapter_outline = f"# {actual_title}\n\n"
-        chapter_outline += f"**场景：** {chapter_skeleton.get('scene', '具体的场景地点')}\n"
-        chapter_outline += f"**登场角色：** {', '.join(chapter_skeleton.get('characters', ['相关人物']))}\n"
-        
-        acts = chapter_skeleton.get('acts', {})
-        chapter_outline += "**三幕式剧情逻辑：**\n"
-        chapter_outline += f"- 第一幕：{acts.get('act_1', '剧情起势')}\n"
-        chapter_outline += f"- 第二幕：{acts.get('act_2', '矛盾爆发/转折')}\n"
-        chapter_outline += f"- 第三幕：{acts.get('act_3', '本章收口/悬念')}\n"
-        state_transition = chapter_skeleton.get("state_transition", "").strip()
-        if state_transition and state_transition != "无":
-            chapter_outline += f"**本章状态目标：** {state_transition}\n"
-        terminal_obligation = chapter_skeleton.get("terminal_obligation", "").strip()
-        if chapter_type == "epilogue" and terminal_obligation:
-            chapter_outline += f"**终章硬约束：** {terminal_obligation}\n"
-        closure_checklist = chapter_skeleton.get("closure_checklist") or []
-        if chapter_type == "epilogue" and closure_checklist:
-            chapter_outline += "**终章逐项收束清单（正文必须全部回应）：**\n"
-            for item in closure_checklist:
-                chapter_outline += f"- {item}\n"
-        opening_callback = chapter_skeleton.get("opening_callback", "").strip()
-        if chapter_type == "epilogue" and opening_callback:
-            chapter_outline += f"**首尾呼应硬要求：** {opening_callback}\n"
-
-        final_prompt = base + continuity_block + FINAL_EXECUTION_TEMPLATE.format(
-            chapter_outline=chapter_outline,
-            transition_block=transition_block,
-            chapter_name=title,
-            title_instr=title_instr,
-            style_requirement=self.setting.get("master_style", "当前设定要求的商业化文风"),
+        final_prompt = get_v3_prompt_bundle(
+            idx=chapter_idx,
+            total_chapters=self.total_chapters,
+            title=actual_title,
+            body=chapter_outline,
+            setting=self.setting,
+            prev_data={'title': '前一章', 'body': history_context} if history_context else None,
+            next_data={'title': (next_chapter_skeleton or {}).get('title', '下一章'), 'body': str(next_chapter_skeleton or {})} if next_chapter_skeleton else None
         )
         return final_prompt
 
-    def _build_continuity_context(self, chapter_idx, history_context="", preview_mode=False, recent_plots_override=None):
-        """构建连续性档案与因果链路"""
-        # 1. 提取当前拟定的到期伏笔
-        due_clues = self.engine.neo4j.get_due_foreshadows(self.novel_id, chapter_idx)
-        clue_context = "、".join([f"[{item['priority']}级] {item['desc']}" for item in due_clues[:4]]) if due_clues else "无"
-        
-        # 2. 动态提取已登场人物列表（从 Neo4j 实时提取）
-        all_chars = self.engine.neo4j.get_all_characters_for_novel(self.novel_id)
-        if not all_chars:
-            all_chars = [self.engine.main_character_name]
-        appeared_characters = ", ".join(all_chars[:8])
-        
-        # 3. 合并历史与到期伏笔为一个连续性胶囊
-        if history_context and history_context != "无前情提要（开局）。":
-            recent_plots = history_context
-        elif recent_plots_override is not None:
-            recent_plots = recent_plots_override
-        else:
-            recent = self.sliding_window_summary[-2:]
-            if recent:
-                recent_plots = self._format_history_context(recent, preview_mode=preview_mode)
-            elif preview_mode:
-                recent_plots = "蓝图预演阶段，正文尚未生成。"
-            else:
-                recent_plots = "故事起始"
 
-        master_style = self.setting.get("master_style", "均衡风格")
-        channel_label = audience_display_label(self.setting.get("audience_type", "通用"))
-        # 仅提取核心描述或前50个字
-        style_summary = master_style.replace('，', ',').split(',')[0][:50]
-        refined_channel = f"【{channel_label}】| {style_summary}"
-        background_label = token_safe_prune(
-            self.engine.book_brief or self.setting.get("world_setting", "未知设定"),
-            max_chars=180,
-            head_ratio=0.75,
-        )
-
-        return CONTINUITY_BLOCK_TEMPLATE.format(
-            background_label=background_label,
-            channel=refined_channel,
-            appeared_characters=appeared_characters,
-            recent_plots=recent_plots,
-            logic_breaks="蓝图预演阶段，等待正文生成后回填真实因果。" if preview_mode else ("无" if chapter_idx == 0 else "补足因果链"),
-            sudden_appearances=clue_context,
-            rewrite_instructions="- 当前是蓝图预演快照，真实生成时必须以前文已完成章节为准。" if preview_mode else ("- 必须：抛出终极悬念，钩住读者，严禁平淡。" if chapter_idx == 0 else "- 保持因果链严密。")
-        )
 
     def _register_planned_foreshadow(self, chapter_idx, chapter_skeleton):
         """把骨架里的计划伏笔提前注册，避免仅靠正文反向抽取导致漏记。"""

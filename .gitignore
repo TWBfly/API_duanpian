@@ -33,3 +33,7 @@ state/
 # SQLite WAL and SHM files
 *.db-shm
 *.db-wal
+
+# Local scratch and broken DBs
+scratch/
+.non_existent_or_broken_db/
